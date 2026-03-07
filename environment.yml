@@ -4,3 +4,8 @@ channels:
   - defaults
 dependencies:
   - python=3.12
+  - ipykernel
+  - jupyterlab
+  - pandas
+  - scikit-learn
+  - plotly
