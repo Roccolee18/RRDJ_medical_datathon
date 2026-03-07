@@ -16,4 +16,11 @@ dependencies:
   - pandas
   - scikit-learn
   - plotly
+  - altair
+  - numpy
+  - pip:
+    - --index-url https://test.pypi.org/simple/
+    - --extra-index-url https://pypi.org/simple/
+    - eda_simplifier #https://ubc-mds.github.io/DSCI_524_Group38_EDAsimplifier/
+    - Missingness_Analyzer
 
