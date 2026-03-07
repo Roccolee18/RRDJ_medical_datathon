@@ -66,7 +66,7 @@ def clean_data(input_path: Path = RAW_DATA_PATH) -> pd.DataFrame:
         "category"
     )
     data[["max_glu_serum", "A1Cresult"]] = (
-        data[["max_glu_serum", "A1Cresult"]].fillna("unknown").astype("category")
+        data[["max_glu_serum", "A1Cresult"]].fillna("not tested").astype("category")
     )
     data[MED_COLS] = data[MED_COLS].astype("category")
     data[["change", "diabetesMed"]] = data[["change", "diabetesMed"]].astype(
