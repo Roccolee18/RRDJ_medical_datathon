@@ -1,0 +1,65 @@
+```{r load libraries, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(infer)
+library(broom)
+library(rstan)
+library(rstantools)
+library(cowplot)
+rstan_options(auto_write = TRUE)
+```
+
+```{r}
+diabetes_data <- read_csv("../../data/cooked/clean_data.csv")
+diabetes_data
+```
+
+```{r}
+problem_cols <- diabetes_data %>%
+  summarise(across(everything(), n_distinct)) %>%
+  pivot_longer(everything(),
+               names_to  = "column",
+               values_to = "n_unique") %>%
+  filter(n_unique < 2)
+
+print(problem_cols)  # these are your offending columns
+```
+
+```{r}
+diabetes_data_clean <- diabetes_data %>%
+  select(where(~ n_distinct(.) > 1))
+```
+
+```{r}
+problem_cols <- diabetes_data_clean %>%
+  summarise(across(everything(), n_distinct)) %>%
+  pivot_longer(everything(),
+               names_to  = "column",
+               values_to = "n_unique") %>%
+  filter(n_unique < 2)
+
+print(problem_cols)
+```
+
+```{r}
+small_clean <- diabetes_data_clean |> slice(1:100)
+small_clean
+```
+
+```{r}
+problem_cols <- small_clean %>%
+  summarise(across(everything(), n_distinct)) %>%
+  pivot_longer(everything(),
+               names_to  = "column",
+               values_to = "n_unique") %>%
+  filter(n_unique < 2)
+
+small_clean_clean <- small_clean %>%
+  select(where(~ n_distinct(.) > 1))
+
+print(small_clean_clean) 
+```
+
+```{r}
+glm_all <- glm(as.factor(readmitted) ~ ., family = binomial, data = small_clean_clean)
+tidy(glm_all) |> filter(p.value < 0.9)
+```
