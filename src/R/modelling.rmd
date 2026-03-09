@@ -63,3 +63,108 @@ print(small_clean_clean)
 glm_all <- glm(as.factor(readmitted) ~ ., family = binomial, data = small_clean_clean)
 tidy(glm_all) |> filter(p.value < 0.9)
 ```
+
+```{r}
+tidy_df |> filter(
+  p.value < 0.1
+)
+```
+
+```{r}
+red_model <- glm(as.formula("as.factor(readmitted) ~ patient_nbr + race + age + 
+                            weight + admission_source_id + admission_type_id + 
+                            discharge_disposition_id + payer_code + 
+                            medical_specialty + num_procedures + 
+                            num_medications + number_emergency + 
+                            number_inpatient + diag_1 + diag_2 + diag_3 + 
+                            number_diagnoses + metformin + repaglinide + 
+                            glipizide + insulin + diabetesMed"),
+                 family = binomial, data = data)
+```
+
+```{r}
+red_tidy_df <- tidy(red_model)
+red_tidy_df
+```
+
+```{r}
+tidy_df |>
+  filter(
+    term %in%c(
+      "weightTRUE",
+      "admission_type_idTRUE",
+      "discharge_disposition_idTRUE",
+      "admission_source_idTRUE"
+    )
+  )
+```
+
+```{r}
+tidy_df |> filter(
+  p.value < 0.1
+)
+```
+
+# Try w/ Elixhauser Comorbidity Index
+
+```{r}
+data <- data %>%
+  select(where(~ n_distinct(.) > 1))
+
+data <- data |> mutate(.row_id = row_number())
+
+diag_long <- data %>%
+  select(.row_id, diag_1, diag_2, diag_3) %>%
+  pivot_longer(
+    cols      = c(diag_1, diag_2, diag_3),
+    names_to  = NULL,
+    values_to = "icd9_code"
+  ) %>%
+  filter(!is.na(icd9_code), icd9_code != "") 
+
+elix_flags <- comorbidity(
+  x       = diag_long,
+  id      = ".row_id",
+  code    = "icd9_code",
+  map     = "elixhauser_icd9_quan",
+  assign0 = FALSE
+)
+
+data <- data %>%
+  select(-diag_1, -diag_2, -diag_3) %>%
+  left_join(elix_flags, by = ".row_id") %>%
+  select(-.row_id)
+```
+
+```{r}
+elixhauser_model <- glm(as.formula("as.factor(readmitted) ~ patient_nbr + race + age + 
+                            weight + admission_source_id + admission_type_id + 
+                            discharge_disposition_id + payer_code + 
+                            medical_specialty + num_procedures + 
+                            num_medications + number_emergency + 
+                            number_inpatient + chf + carit + valv + pcd + pvd +
+                            hypunc + hypc + para + ond + cpd + diabunc + diabc +
+                            hypothy + rf + ld + pud + aids + lymph + metacanc +
+                            solidtum + rheumd + coag + obes + wloss + fed + 
+                            blane + dane + alcohol + drug + psycho + depre +
+                            number_diagnoses + metformin + repaglinide + 
+                            glipizide + insulin + diabetesMed"),
+                 family = binomial, data = data)
+```
+
+```{r}
+elixhauser_tidy_df <- tidy(elixhauser_model, exponentiate = TRUE)
+elixhauser_tidy_df
+```
+
+```{r}
+elixhauser_tidy_df |>
+  filter(
+    term %in%c(
+      "weightTRUE",
+      "admission_type_idTRUE",
+      "discharge_disposition_idTRUE",
+      "admission_source_idTRUE"
+    )
+  )
+```
