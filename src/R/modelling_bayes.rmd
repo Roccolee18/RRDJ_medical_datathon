@@ -1,0 +1,426 @@
+```{r load libraries, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(infer)
+library(broom)
+library(rstan)
+library(rstantools)
+library(cowplot)
+rstan_options(auto_write = TRUE)
+library(comorbidity)
+library(fastDummies)
+```
+
+```{r}
+data <- read_csv("../../data/cooked/clean_data.csv")
+data
+```
+
+```{r}
+problem_cols <- data %>%
+  summarise(across(everything(), n_distinct)) %>%
+  pivot_longer(everything(),
+               names_to  = "column",
+               values_to = "n_unique") %>%
+  filter(n_unique < 2)
+
+print(problem_cols)  # these are your offending columns
+```
+
+```{r}
+data <- data %>%
+  select(where(~ n_distinct(.) > 1))
+
+data <- data |> mutate(.row_id = row_number())
+
+diag_long <- data %>%
+  select(.row_id, diag_1, diag_2, diag_3) %>%
+  pivot_longer(
+    cols      = c(diag_1, diag_2, diag_3),
+    names_to  = NULL,
+    values_to = "icd9_code"
+  ) %>%
+  filter(!is.na(icd9_code), icd9_code != "") 
+
+elix_flags <- comorbidity(
+  x       = diag_long,
+  id      = ".row_id",
+  code    = "icd9_code",
+  map     = "elixhauser_icd9_quan",
+  assign0 = FALSE
+)
+
+data <- data %>%
+  select(-diag_1, -diag_2, -diag_3) %>%
+  left_join(elix_flags, by = ".row_id") %>%
+  select(-.row_id)
+```
+
+
+```{r}
+# -----------------------------------------------------------------------------
+# 1. MEDICATION COLUMNS
+#    - Binary column: 1 if taking medication, 0 if not
+#    - Ordinal column: Steady=0, Down=-1, Up=1, No=0
+# -----------------------------------------------------------------------------
+
+med_cols <- c("metformin", "repaglinide", "nateglinide", "chlorpropamide",
+              "glimepiride", "acetohexamide", "glipizide", "glyburide",
+              "tolbutamide", "pioglitazone", "rosiglitazone", "acarbose",
+              "miglitol", "troglitazone", "tolazamide", "examide",
+              "citoglipton", "insulin", "glyburide.metformin",
+              "glipizide.metformin", "glimepiride.pioglitazone",
+              "metformin.rosiglitazone", "metformin.pioglitazone",
+              "glyburide-metformin", "glipizide-metformin",
+              "glimepiride-pioglitazone", "metformin-rosiglitazone",
+              "metformin-pioglitazone", "max_glu_serum_level")
+
+encode_medication <- function(data, col) {
+  binary_col  <- paste0(col, "_prescribed")
+  ordinal_col <- paste0(col, "_change")
+
+  data[[binary_col]]  <- ifelse(data[[col]] == "No", 0L, 1L)
+  data[[ordinal_col]] <- case_when(
+    data[[col]] == "Up"     ~  1L,
+    data[[col]] == "Down"   ~ -1L,
+    data[[col]] == "Steady" ~  0L,
+    data[[col]] == "No"     ~  0L,
+    TRUE                  ~  NA_integer_
+  )
+  data
+}
+
+for (col in med_cols) {
+  if (col %in% names(data)) {
+    data <- encode_medication(data, col)
+  }
+}
+
+# Drop original medication columns
+data <- data %>% select(-all_of(med_cols[med_cols %in% names(data)]))
+
+
+# -----------------------------------------------------------------------------
+# 2. GENDER
+#    Reference category: "Female"
+#    Levels: Female (dropped), Male, Unknown/Invalid
+# -----------------------------------------------------------------------------
+
+data <- data %>%
+  mutate(
+    gender_male    = ifelse(gender == "Male", 1L, 0L),
+    gender_unknown = ifelse(gender == "Unknown/Invalid", 1L, 0L)
+  ) %>%
+  select(-gender)
+
+
+# -----------------------------------------------------------------------------
+# 3. RACE
+#    Reference category: "Caucasian"
+#    Levels: Caucasian (dropped), AfricanAmerican, Asian, Hispanic, Other
+#    Missing values: encoded as their own "Unknown" dummy
+# -----------------------------------------------------------------------------
+
+data <- data %>%
+  mutate(race = ifelse(is.na(race), "Unknown", race)) %>%
+  dummy_cols(
+    select_columns    = "race",
+    remove_first_dummy        = FALSE,   # manually dropped below
+    remove_selected_columns   = TRUE
+  ) %>%
+  select(-race_Caucasian)   # reference category
+
+
+# -----------------------------------------------------------------------------
+# 4. AGE
+#    Ordinal encoding: [0-10) = 1 through [90-100) = 10
+# -----------------------------------------------------------------------------
+
+age_levels <- c("[0-10)", "[10-20)", "[20-30)", "[30-40)", "[40-50)",
+                "[50-60)", "[60-70)", "[70-80)", "[80-90)", "[90-100)")
+
+data <- data %>%
+  mutate(age_ordinal = match(age, age_levels)) %>%
+  select(-age)
+
+
+# -----------------------------------------------------------------------------
+# 5. CHANGE & DIABETESMED
+#    Both are binary Yes/No or Ch/No
+# -----------------------------------------------------------------------------
+
+data <- data %>%
+  mutate(
+    change      = ifelse(change == "Ch", 1L, 0L),
+    diabetesMed = ifelse(diabetesMed == "Yes", 1L, 0L)
+  )
+
+
+# -----------------------------------------------------------------------------
+# 6. MAX_GLU_SERUM
+#    Levels: None, Norm, >200, >300
+#    Encoding: binary for tested, ordinal for result
+#    Reference for ordinal: None/Norm collapsed as "not elevated"
+# -----------------------------------------------------------------------------
+
+data <- data %>%
+  mutate(
+    max_glu_serum_tested = ifelse(max_glu_serum == "None", 0L, 1L),
+    max_glu_serum_level  = case_when(
+      max_glu_serum == "None" ~  0L,
+      max_glu_serum == "Norm" ~  0L,
+      max_glu_serum == ">200" ~  1L,
+      max_glu_serum == ">300" ~  2L,
+      TRUE                    ~  0
+    )
+  ) %>%
+  select(-max_glu_serum)
+
+
+# -----------------------------------------------------------------------------
+# 7. A1CRESULT
+#    Levels: None, Norm, >7, >8
+#    Encoding: binary for tested, ordinal for result
+# -----------------------------------------------------------------------------
+
+data <- data %>%
+  mutate(
+    A1Cresult_tested = ifelse(A1Cresult == "None", 0L, 1L),
+    A1Cresult_level  = case_when(
+      A1Cresult == "None" ~  0L,
+      A1Cresult == "Norm" ~  0L,
+      A1Cresult == ">7"   ~  1L,
+      A1Cresult == ">8"   ~  2L,
+      TRUE                ~  0
+    )
+  ) %>%
+  select(-A1Cresult)
+
+
+# -----------------------------------------------------------------------------
+# 8. MISSINGNESS INDICATORS
+#    weight, admission_type_id, discharge_disposition_id, admission_source_id
+#    Encoded as binary: 1 if recorded, 0 if missing
+# -----------------------------------------------------------------------------
+
+data <- data %>%
+  mutate(
+    weight                   = ifelse(is.na(weight), 0L, 1L),
+    admission_type_id        = ifelse(is.na(admission_type_id), 0L, 1L),
+    discharge_disposition_id = ifelse(is.na(discharge_disposition_id), 0L, 1L),
+    admission_source_id     = ifelse(is.na(admission_source_id), 0L, 1L)
+  )
+
+
+# -----------------------------------------------------------------------------
+# 9. MEDICAL SPECIALTY — DUMMY ENCODE ALL LEVELS
+#    Treat NA as its own category, drop first level as reference
+# -----------------------------------------------------------------------------
+
+data <- data %>%
+  mutate(medical_specialty = ifelse(is.na(medical_specialty),
+                                    "Unknown", medical_specialty)) %>%
+  mutate(medical_specialty = as.factor(medical_specialty)) %>%
+  dummy_cols(
+    select_columns          = "medical_specialty",
+    remove_first_dummy      = TRUE,
+    remove_selected_columns = TRUE
+  )
+
+
+# -----------------------------------------------------------------------------
+# 10. PAYER CODE
+#    High-cardinality, treat NA as Unknown, dummy encode
+# -----------------------------------------------------------------------------
+
+data <- data %>%
+  mutate(payer_code = ifelse(is.na(payer_code), "Unknown", payer_code)) %>%
+  mutate(payer_code = as.factor(payer_code)) %>%
+  dummy_cols(
+    select_columns          = "payer_code",
+    remove_first_dummy      = TRUE,
+    remove_selected_columns = TRUE
+  )
+
+
+# -----------------------------------------------------------------------------
+# 11. OUTCOME — READMITTED
+#     Binarize: <30 days = 1, otherwise = 0
+# -----------------------------------------------------------------------------
+
+data <- data %>%
+  mutate(readmitted = ifelse(readmitted == "<30", 1L, 0L))
+
+
+# -----------------------------------------------------------------------------
+# 12. DROP ID COLUMNS
+# -----------------------------------------------------------------------------
+
+data <- data %>%
+  select(-patient_nbr)
+
+```
+
+```{stan output.var='stan_post'}
+data {
+  int<lower=0> N;          // number of encounters
+  int<lower=0> J;          // number of missable fields
+  int<lower=0> K;          // number of clinical covariates
+  matrix[N, J] M;          // missingness indicators m_ij
+  matrix[N, K] X;          // clinical covariates
+  array[N] int<lower=0, upper=1> y;  // readmission outcome
+}
+
+parameters {
+  real alpha;              // intercept
+  vector[J] beta;          // field missingness coefficients
+  vector[K] gamma;         // clinical covariate coefficients
+}
+
+model {
+  // Priors
+  alpha ~ normal(0, 2);
+  beta  ~ normal(0, 1);
+  gamma ~ normal(0, 1);
+
+  // Likelihood
+  vector[N] log_odds = alpha + M * beta + X * gamma;
+  y ~ bernoulli_logit(log_odds);
+}
+
+generated quantities {
+  // Posterior probability that recording field j reduces readmission risk
+  array[J] int beta_negative;
+  for (j in 1:J) {
+    beta_negative[j] = (beta[j] < 0) ? 1 : 0;
+  }
+
+  // Posterior predictive checks
+  array[N] int y_rep;
+  {
+    vector[N] log_odds = alpha + M * beta + X * gamma;
+    for (i in 1:N) {
+      y_rep[i] = bernoulli_logit_rng(log_odds[i]);
+    }
+  }
+}
+```
+
+```{r}
+missable <- data |>
+  select(weight, admission_type_id, discharge_disposition_id, admission_source_id)
+
+clinical <- data |>
+  select(-weight, -admission_type_id, -discharge_disposition_id, -admission_source_id, -readmitted) |>
+  mutate(across(everything(), as.numeric))
+
+stan_data <- list(
+  N = nrow(data),
+  J = ncol(missable),
+  K = ncol(clinical),
+  M = as.matrix(missable),
+  X = as.matrix(clinical),
+  y = data$readmitted
+)
+```
+
+```{r}
+model <- sampling(
+  object = stan_post,
+  data = stan_data,
+  chains = 2,
+  iter = 5000,
+  warmup = 500,
+  thin = 2,
+  seed = 553,
+  cores = 8
+)
+```
+
+```{r}
+results <- as.data.frame(model)
+```
+
+```{r}
+intercept_hist <- results |>
+    ggplot() +
+    geom_histogram(aes(alpha), fill = "grey", color = "black", bins = 100) +
+    theme(
+    plot.title = element_text(size = 12, face = "bold"),
+    axis.text = element_text(size = 10),
+    axis.title = element_text(size = 10)
+  ) +
+    ggtitle("Histogram of Posterior Samples of Intercept alpha") +
+    labs(x = "Parameter alpha", y = "Count")
+intercept_hist
+```
+
+```{r}
+weight_hist <- results |> ggplot() +
+  geom_histogram(aes(`beta[1]`), fill = "grey", color = "black", bins = 100) +
+  theme(
+  plot.title = element_text(size = 12, face = "bold"),
+  axis.text = element_text(size = 10),
+  axis.title = element_text(size = 10)
+) +
+  ggtitle("Histogram of Posterior Samples of Weight Coefficient") +
+  labs(x = "Parameter beta_1", y = "Count")
+weight_hist
+```
+
+
+```{r}
+admission_type_hist <- results |> ggplot() +
+  geom_histogram(aes(`beta[2]`), fill = "grey", color = "black", bins = 100) +
+  theme(
+  plot.title = element_text(size = 12, face = "bold"),
+  axis.text = element_text(size = 10),
+  axis.title = element_text(size = 10)
+) +
+  ggtitle("Histogram of Posterior Samples of Admission Type Coefficient") +
+  labs(x = "Parameter beta_2", y = "Count")
+admission_type_hist
+```
+```{r}
+discharge_hist <- results |> ggplot() +
+  geom_histogram(aes(`beta[3]`), fill = "grey", color = "black", bins = 100) +
+  theme(
+  plot.title = element_text(size = 12, face = "bold"),
+  axis.text = element_text(size = 10),
+  axis.title = element_text(size = 10)
+) +
+  ggtitle("Histogram of Posterior Samples of Discharge Disposition Coefficient") +
+  labs(x = "Parameter beta_3", y = "Count")
+discharge_hist
+```
+```{r}
+admission_source_hist <- results |> ggplot() +
+  geom_histogram(aes(`beta[4]`), fill = "grey", color = "black", bins = 100) +
+  theme(
+  plot.title = element_text(size = 12, face = "bold"),
+  axis.text = element_text(size = 10),
+  axis.title = element_text(size = 10)
+) +
+  ggtitle("Histogram of Posterior Samples of Admission Source Coefficient") +
+  labs(x = "Parameter beta_4", y = "Count")
+admission_source_hist
+```
+```{r}
+# posterior credible intervals
+weight_pi <- posterior_interval(as.matrix(results$`beta[1]`), prob = 0.8)
+admission_type_pi <- posterior_interval(as.matrix(results$`beta[2]`), prob = 0.8)
+discharge_pi <- posterior_interval(as.matrix(results$`beta[3]`), prob = 0.8)
+admission_source_pi <- posterior_interval(as.matrix(results$`beta[4]`), prob = 0.8)
+
+weight_pi
+admission_type_pi
+discharge_pi
+admission_source_pi
+```
+
+```{r}
+write_csv(data.frame(results$`beta[1]`), "../../results/bayes_weight.csv")
+write_csv(data.frame(results$`beta[2]`), "../../results/bayes_admission_type.csv")
+write_csv(data.frame(results$`beta[3]`), "../../results/bayes_discharge_disposition.csv")
+write_csv(data.frame(results$`beta[4]`), "../../results/bayes_admission_source.csv")
+```
+
